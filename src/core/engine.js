@@ -2246,13 +2246,21 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     onProgress(14, 'Indexing archive');
     if (typeof zip === 'undefined') throw new Error('zip.js not loaded');
     const zipReader = new zip.ZipReader(new zip.BlobReader(archiveBlob));
-    const zipEntries = await zipReader.getEntries();
-    if (zipEntries.length > ARCHIVE_LIMITS.entries) throw new Error('Archive contains too many entries (' + zipEntries.length + ')');
+    let zipEntries;
+    try { zipEntries = await zipReader.getEntries(); }
+    catch (error) { await zipReader.close().catch(() => {}); throw error; }
+    if (zipEntries.length > ARCHIVE_LIMITS.entries) {
+        await zipReader.close();
+        throw new Error('Archive contains too many entries (' + zipEntries.length + ')');
+    }
     let declaredUncompressed = 0;
     for (const entry of zipEntries) {
         const size = Number(entry.uncompressedSize || 0), compressed = Number(entry.compressedSize || 0);
         declaredUncompressed += size;
-        if (declaredUncompressed > ARCHIVE_LIMITS.totalUncompressed) throw new Error('Archive expands beyond the 64 GiB safety limit');
+        if (declaredUncompressed > ARCHIVE_LIMITS.totalUncompressed) {
+            await zipReader.close();
+            throw new Error('Archive expands beyond the 64 GiB safety limit');
+        }
         if (size > 1024 * 1024 && compressed > 0 && size / compressed > ARCHIVE_LIMITS.entryRatio) throw new Error('Suspicious compression ratio in ' + entry.filename);
     }
     const zipFiles = new Map(zipEntries.map(entry => [entry.filename, entry]));
