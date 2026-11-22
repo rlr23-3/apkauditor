@@ -2306,6 +2306,8 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
         } catch (e) { R.warnings.push('Failed to scan ' + path + ': ' + (e.message || e)); }
     }
 
+    await zipReader.close();
+
     onProgress(90, 'Detecting trackers');
     R.trackers = detectTrackers(allDexStrings, R.files);
 
@@ -2349,7 +2351,6 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     R.securityScore = computeScore(grouped, R);
 
     onProgress(100, 'Done');
-    await zipReader.close();
     return R;
 }
 
