@@ -1117,24 +1117,33 @@ async function openFile(path) {
         const chunks = [];
         let retained = 0;
         const previewLimit = 4 * 1024 * 1024;
-        await entry.getData(new WritableStream({
-            write(chunk) {
-                if (requestId !== State.currentOpenRequest) return;
-                const keep = Math.min(chunk.byteLength, previewLimit - retained);
-                if (keep > 0) {
-                    chunks.push(chunk.slice(0, keep));
-                    retained += keep;
+        let previewTruncated = false;
+        try {
+            await entry.getData(new WritableStream({
+                write(chunk) {
+                    if (requestId !== State.currentOpenRequest) throw new Error('PREVIEW_CANCELLED');
+                    const keep = Math.min(chunk.byteLength, previewLimit - retained);
+                    if (keep > 0) {
+                        chunks.push(chunk.slice(0, keep));
+                        retained += keep;
+                    }
+                    if (keep < chunk.byteLength || retained >= previewLimit) {
+                        previewTruncated = true;
+                        throw new Error('PREVIEW_LIMIT');
+                    }
                 }
-            }
-        }));
-        if (requestId !== State.currentOpenRequest) return;
+            }));
+        } catch (previewError) {
+            if (!previewError || !['PREVIEW_LIMIT', 'PREVIEW_CANCELLED'].includes(previewError.message)) throw previewError;
+        }
+        if (requestId !== State.currentOpenRequest || (previewTruncated && Number(entry.uncompressedSize || 0) <= previewLimit)) return;
         const data = new Uint8Array(retained);
         let offset = 0;
         for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }
         State.currentOpenBytes = data;
         if (dl) dl.disabled = false;
         const declaredSize = Number(entry.uncompressedSize || 0);
-        if (declaredSize > previewLimit) {
+        if (declaredSize > previewLimit || previewTruncated) {
             viewer.innerHTML = '<div class="no-data">Preview limited to the first 4 MiB of ' + esc(fmtSize(declaredSize)) + '. Use Download to save the complete entry without loading it all into memory.</div>';
             return;
         }
