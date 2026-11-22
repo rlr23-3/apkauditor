@@ -95,6 +95,7 @@ async function analyzeFile(file) {
     document.body.classList.add('analyzing');
     showProgress(0, 'Initializing…');
     State.currentFile = file;
+    if (State.viewerZip && State.viewerZip.reader) State.viewerZip.reader.close().catch(() => {});
     State.viewerZip = null;
     if (file.size > MAX_APK_SIZE_BYTES) {
         throw new Error('File exceeds the 16 GiB upload limit.');
@@ -107,8 +108,8 @@ async function analyzeFile(file) {
         // Read on the main thread only when the worker is unavailable or cannot accept the File.
         // Sending the File avoids a second full-size ArrayBuffer copy for large APKs.
         const runOnMainThreadFallback = () => {
-            file.arrayBuffer()
-                .then(arrayBuffer => runOnMainThread(arrayBuffer, fileMeta))
+            Promise.resolve()
+                .then(() => runOnMainThread(file, fileMeta))
                 .then(resolve, reject);
         };
         const useWorker = State.worker && !State.workerFailed;
@@ -144,22 +145,27 @@ async function analyzeFile(file) {
         }
     });
 }
-async function runOnMainThread(arrayBuffer, fileMeta) {
+async function runOnMainThread(file, fileMeta) {
     if (!window.APKA || typeof window.APKA.analyzeAPK !== 'function') {
         throw new Error('Engine not loaded');
     }
-    return window.APKA.analyzeAPK(arrayBuffer, fileMeta, {
+    return window.APKA.analyzeAPK(file, fileMeta, {
         onProgress: (percent, text) => showProgress(percent || 0, text || '…'),
     });
 }
 
 async function getViewerZip() {
     if (State.viewerZip) return State.viewerZip;
-    if (!State.currentFile) return null;
-    if (typeof JSZip === 'undefined') return null;
-    const buf = await State.currentFile.arrayBuffer();
-    State.viewerZip = await JSZip.loadAsync(buf);
-    return State.viewerZip;
+    if (!State.currentFile || typeof zip === 'undefined') return null;
+    const reader = new zip.ZipReader(new zip.BlobReader(State.currentFile));
+    try {
+        const entries = await reader.getEntries();
+        State.viewerZip = { reader, entries: new Map(entries.map(entry => [entry.filename, entry])) };
+        return State.viewerZip;
+    } catch (error) {
+        await reader.close();
+        throw error;
+    }
 }
 
 function showProgress(pct, text, payload) {
@@ -1094,15 +1100,16 @@ async function openFile(path) {
             viewer.innerHTML = '<div class="no-data">Drop the APK again to enable the inline viewer (analysis results remain loaded).</div>';
             return;
         }
-        const entry = zip.file(path);
+        const entry = zip.entries.get(path);
         if (!entry) {
             viewer.innerHTML = '<div class="no-data">File not found in archive: ' + esc(path) + '</div>';
             return;
         }
-        const data = await entry.async('arraybuffer');
-        State.currentOpenBytes = new Uint8Array(data);
+        const data = await entry.getData(new zip.Uint8ArrayWriter());
+        State.currentOpenBytes = data;
+        const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
         if (dl) dl.disabled = false;
-        renderFile(viewer, path, data);
+        renderFile(viewer, path, buffer);
     } catch (e) {
         viewer.innerHTML = '<div class="no-data">' + esc(e.message || 'Unable to read file') + '</div>';
     }
