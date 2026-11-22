@@ -1160,8 +1160,13 @@ async function downloadCurrentFile() {
         let handle;
         try {
             handle = await window.showSaveFilePicker({ suggestedName: State.currentOpenFile.split('/').pop() });
-            const writable = await handle.createWritable();
-            await entry.getData(writable);
+            const fileWritable = await handle.createWritable();
+            const sink = new WritableStream({
+                write(chunk) { return fileWritable.write(chunk); },
+                close() { return fileWritable.close(); },
+                abort(reason) { return fileWritable.abort(reason); }
+            });
+            await entry.getData(sink);
             toast('File saved using streaming extraction.', 'success');
             return;
         } catch (error) {
