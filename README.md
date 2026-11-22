@@ -12,7 +12,7 @@ Try it: [apkauditor.com](https://apkauditor.com)
 
 ## What it actually does
 
-It runs everything client-side. The APK ZIP is read with JSZip, then:
+It runs everything client-side. The APK ZIP is indexed with zip.js using a Blob-backed reader, then:
 
 - **DEX parsing** reads the header, string pool, type IDs, method IDs, class defs, and bytecode. Up to 10 DEX files are supported (classes.dex through classes10.dex).
 - **AXML parser** decodes the binary AndroidManifest into XML so you can read it.
@@ -38,11 +38,12 @@ src/
     export.js          JSON / CSV / SARIF 2.1 export
     pdf.js             Printable PDF audit report
 lib/
-  jszip.min.js
+  zip.min.js
+  zipjs.LICENSE.txt
   jspdf.umd.min.js
 ```
 
-Analysis runs in a Web Worker, so the UI stays responsive while an APK is being parsed. The selected `File` is passed to the worker and converted to an `ArrayBuffer` there, avoiding an additional full-size buffer copy on the main thread. If the worker cannot be used, the page falls back to the main thread.
+Analysis runs in a Web Worker, so the UI stays responsive while an APK is being parsed. The selected `File` is passed directly to the worker. zip.js reads ZIP directory and entry data through a Blob-backed random-access reader; selected entries are decompressed on demand. The current SHA-256/MD5 and APK-signature routines still materialize the complete APK as an `ArrayBuffer`, and DEX parsing still holds extracted DEX data in memory, so this is an incremental library migration rather than end-to-end 16 GiB streaming. If the worker cannot be used, the page falls back to the main thread.
 
 ## Tabs
 
@@ -109,7 +110,7 @@ The selected APK stays on your device. Its `File` handle is passed to the Web Wo
 
 ## Limits
 
-- APK/ZIP uploads are accepted up to **16 GiB**. This is a file-size ceiling, not a guarantee that a browser can process an archive of that size: the current JSZip-based analyzer still requires the archive and extracted content in memory, and actual limits depend on the browser, operating system, and available RAM.
+- APK/ZIP uploads are accepted up to **16 GiB**. This is a file-size ceiling, not a guarantee that a browser can process an archive of that size: whole-file hashing/signature inspection and DEX parsing still require large in-memory buffers. Actual limits depend on the browser, operating system, and available RAM.
 - Each rule emits at most 20 instances per file, capped at 500 per rule globally
 - Up to 5000 DEX classes are scanned for rule patterns (the parser still reads them all)
 - Resource files larger than 300 KB are sampled rather than scanned end-to-end
