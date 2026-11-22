@@ -2264,12 +2264,6 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
         if (size > 1024 * 1024 && compressed > 0 && size / compressed > ARCHIVE_LIMITS.entryRatio) throw new Error('Suspicious compression ratio in ' + entry.filename);
     }
     const zipFiles = new Map(zipEntries.map(entry => [entry.filename, entry]));
-    const readEntryBuffer = async entry => {
-        const bytes = await entry.getData(new zip.Uint8ArrayWriter());
-        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    };
-    const readEntryText = async entry => entry.getData(new zip.TextWriter());
-
     onProgress(18, 'Indexing files');
     for (const entry of zipEntries) {
         const path = entry.filename;
