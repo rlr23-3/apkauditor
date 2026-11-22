@@ -1127,7 +1127,7 @@ async function openFile(path) {
                         chunks.push(chunk.slice(0, keep));
                         retained += keep;
                     }
-                    if (keep < chunk.byteLength || retained >= previewLimit) {
+                    if (keep < chunk.byteLength) {
                         previewTruncated = true;
                         throw new Error('PREVIEW_LIMIT');
                     }
@@ -1136,7 +1136,7 @@ async function openFile(path) {
         } catch (previewError) {
             if (!previewError || !['PREVIEW_LIMIT', 'PREVIEW_CANCELLED'].includes(previewError.message)) throw previewError;
         }
-        if (requestId !== State.currentOpenRequest || (previewTruncated && Number(entry.uncompressedSize || 0) <= previewLimit)) return;
+        if (requestId !== State.currentOpenRequest) return;
         const data = new Uint8Array(retained);
         let offset = 0;
         for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }
