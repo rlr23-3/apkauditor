@@ -4,9 +4,24 @@
 const esc = s => { if (!s && s !== 0) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); };
 const formatSize = b => b < 1024 ? b + ' B' : b < 1048576 ? (b/1024).toFixed(1) + ' KB' : (b/1048576).toFixed(2) + ' MB';
 
-async function sha256hex(buf) {
-    const h = await crypto.subtle.digest('SHA-256', buf);
-    return Array.from(new Uint8Array(h)).map(b => b.toString(16).padStart(2,'0')).join('');
+async function hashBlob(blob, onProgress) {
+    if (!root.sha256 || !root.md5) throw new Error('Incremental hash libraries are not loaded');
+    const sha = root.sha256.create();
+    const md = root.md5.create();
+    const reader = blob.stream().getReader();
+    let bytes = 0;
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            sha.update(value);
+            md.update(value);
+            bytes += value.byteLength;
+            if (onProgress) onProgress(bytes, blob.size);
+            await yield_();
+        }
+    } finally { reader.releaseLock(); }
+    return { sha256: sha.hex(), md5: md.hex() };
 }
 async function md5hex(buf) {
     const b = new Uint8Array(buf);
@@ -2080,6 +2095,127 @@ function generateSmaliView(cls, buf, allStrings, allTypes, allMethods, allFields
     return L.join('\n');
 }
 
+
+const ARCHIVE_LIMITS = Object.freeze({
+    entries: 200000, totalUncompressed: 64 * 1024 * 1024 * 1024,
+    entryRatio: 1000, smallEntry: 16 * 1024 * 1024,
+    dexMemory: 256 * 1024 * 1024, preview: 4 * 1024 * 1024,
+    textPreview: 512 * 1024, textScan: 16 * 1024 * 1024,
+    manifest: 16 * 1024 * 1024, resources: 64 * 1024 * 1024,
+    certificate: 16 * 1024 * 1024, overlap: 65536
+});
+
+async function readEntryLimited(entry, limit, label) {
+    const size = Number(entry.uncompressedSize || 0);
+    if (size > limit) throw new Error(label + ' exceeds the ' + formatSize(limit) + ' analysis limit');
+    const data = await entry.getData(new zip.Uint8ArrayWriter());
+    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+}
+
+async function scanTextEntry(entry, path, findings, entropyApi) {
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+    const seen = new Set();
+    let carry = '', baseLine = 1, bytes = 0, preview = '';
+    const maxScan = ARCHIVE_LIMITS.textScan, overlap = ARCHIVE_LIMITS.overlap;
+    const scanWindow = text => {
+        if (!text) return;
+        for (const finding of analyzeContent(text, path, ANDROID_RULES)) {
+            const key = [finding.ruleId, finding.line + baseLine - 1, finding.match].join('|');
+            if (seen.has(key)) continue;
+            seen.add(key);
+            finding.line = (finding.line || 1) + baseLine - 1;
+            findings.push(finding);
+        }
+        if (entropyApi) {
+            for (const secret of entropyApi.detectSecrets(text)) {
+                const localLine = (text.slice(0, secret.index).match(/\n/g) || []).length + 1;
+                const key = [secret.ruleId, baseLine + localLine - 1, secret.match].join('|');
+                if (seen.has(key)) continue;
+                seen.add(key);
+                secret.file = path;
+                secret.line = baseLine + localLine - 1;
+                findings.push(secret);
+            }
+        }
+    };
+    const sink = new WritableStream({
+        write(chunk) {
+            bytes += chunk.byteLength;
+            if (preview.length < ARCHIVE_LIMITS.textPreview) {
+                const part = decoder.decode(chunk, { stream: true });
+                preview += part.slice(0, ARCHIVE_LIMITS.textPreview - preview.length);
+            } else {
+                decoder.decode(chunk, { stream: true });
+            }
+            if (bytes > maxScan) return;
+            const fresh = decoder.decode(new Uint8Array(0), { stream: true });
+            const windowText = carry + fresh;
+            if (windowText) {
+                scanWindow(windowText);
+                const keepFrom = Math.max(0, windowText.length - overlap);
+                baseLine += (windowText.slice(0, keepFrom).match(/\n/g) || []).length;
+                carry = windowText.slice(keepFrom);
+            }
+        },
+        close() {
+            const tail = decoder.decode();
+            const windowText = carry + tail;
+            if (bytes <= maxScan) scanWindow(windowText);
+        }
+    });
+    await entry.getData(sink);
+    return { preview, bytes, truncated: bytes > maxScan };
+}
+
+async function stageDexInOPFS(entry, path) {
+    if (!navigator.storage || typeof navigator.storage.getDirectory !== 'function') {
+        throw new Error('Origin Private File System is unavailable; large DEX parsing was skipped');
+    }
+    const rootDir = await navigator.storage.getDirectory();
+    const dir = await rootDir.getDirectoryHandle('apk-auditor-temp', { create: true });
+    const safeName = path.replace(/[^a-zA-Z0-9._-]/g, '_') + '-' + Date.now() + '.dex';
+    const handle = await dir.getFileHandle(safeName, { create: true });
+    const writable = await handle.createWritable();
+    try {
+        await entry.getData(writable);
+        return { file: await handle.getFile(), cleanup: () => dir.removeEntry(safeName).catch(() => {}) };
+    } catch (error) {
+        await writable.abort(error).catch(() => {});
+        await dir.removeEntry(safeName).catch(() => {});
+        throw error;
+    }
+}
+
+async function parseDexStringsFromFile(file) {
+    const read = async (offset, length) => new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+    if (file.size < 112) return [];
+    const header = await read(0, 112);
+    const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+    if (new TextDecoder().decode(header.subarray(0, 4)) !== 'dex\n') return [];
+    const count = Math.min(view.getUint32(56, true), 50000);
+    const offset = view.getUint32(60, true);
+    if (count > 50000 || offset + count * 4 > file.size) throw new Error('DEX string table is out of bounds');
+    const table = await read(offset, count * 4);
+    const tableView = new DataView(table.buffer, table.byteOffset, table.byteLength);
+    const strings = [];
+    for (let i = 0; i < count; i++) {
+        const at = tableView.getUint32(i * 4, true);
+        if (at >= file.size) { strings.push(''); continue; }
+        const bytes = await read(at, Math.min(8192, file.size - at));
+        let p = 0, shift = 0, length = 0, b = 0, steps = 0;
+        do {
+            if (p >= bytes.length || steps++ > 5) break;
+            b = bytes[p++]; length |= (b & 0x7f) << shift; shift += 7;
+        } while (b & 0x80);
+        if (length > 4096 || p >= bytes.length) { strings.push(''); continue; }
+        let end = p;
+        while (end < bytes.length && bytes[end] !== 0 && end - p <= 8192) end++;
+        strings.push(new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(p, end)));
+        if (i % 1000 === 0) await yield_();
+    }
+    return strings;
+}
+
 async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     opts = opts || {};
     const onProgress = opts.onProgress || (() => {});
@@ -2101,18 +2237,26 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     const archiveBlob = fileOrBuffer instanceof Blob
         ? fileOrBuffer
         : new Blob([fileOrBuffer], { type: 'application/vnd.android.package-archive' });
-    // Hashing and APK signature inspection still require a contiguous buffer;
-    // zip.js reads the archive entries directly from the original Blob.
-    const arrayBuffer = fileOrBuffer instanceof ArrayBuffer
-        ? fileOrBuffer
-        : await archiveBlob.arrayBuffer();
-    R.appInfo.sha256 = await sha256hex(arrayBuffer);
-    R.appInfo.md5 = await md5hex(arrayBuffer);
+    const hashes = await hashBlob(archiveBlob, (done, total) => {
+        if (done % (32 * 1024 * 1024) < 1024 * 1024) {
+            onProgress(5 + Math.floor(5 * done / Math.max(1, total)), 'Hashing APK · ' + formatSize(done));
+        }
+    });
+    R.appInfo.sha256 = hashes.sha256;
+    R.appInfo.md5 = hashes.md5;
 
     onProgress(14, 'Indexing archive');
     if (typeof zip === 'undefined') throw new Error('zip.js not loaded');
     const zipReader = new zip.ZipReader(new zip.BlobReader(archiveBlob));
     const zipEntries = await zipReader.getEntries();
+    if (zipEntries.length > ARCHIVE_LIMITS.entries) throw new Error('Archive contains too many entries (' + zipEntries.length + ')');
+    let declaredUncompressed = 0;
+    for (const entry of zipEntries) {
+        const size = Number(entry.uncompressedSize || 0), compressed = Number(entry.compressedSize || 0);
+        declaredUncompressed += size;
+        if (declaredUncompressed > ARCHIVE_LIMITS.totalUncompressed) throw new Error('Archive expands beyond the 64 GiB safety limit');
+        if (size > 1024 * 1024 && compressed > 0 && size / compressed > ARCHIVE_LIMITS.entryRatio) throw new Error('Suspicious compression ratio in ' + entry.filename);
+    }
     const zipFiles = new Map(zipEntries.map(entry => [entry.filename, entry]));
     const readEntryBuffer = async entry => {
         const bytes = await entry.getData(new zip.Uint8ArrayWriter());
@@ -2148,7 +2292,7 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     const mf = zipFiles.get('AndroidManifest.xml');
     if (mf) {
         try {
-            const mb = await readEntryBuffer(mf);
+            const mb = await readEntryLimited(mf, ARCHIVE_LIMITS.manifest, 'AndroidManifest.xml');
             const parser = new AXMLParser(mb);
             R.manifest = parser.parse();
             if (R.manifest) {
@@ -2166,7 +2310,7 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     for (const path of zipFiles.keys()) {
         if (/META-INF\/.+\.(RSA|DSA|EC)$/i.test(path)) {
             try {
-                const cb = await readEntryBuffer(zipFiles.get(path));
+                const cb = await readEntryLimited(zipFiles.get(path), ARCHIVE_LIMITS.certificate, 'Signing certificate');
                 const cp = new CertParser(cb);
                 R.certInfo = cp.findCert();
                 if (R.certInfo) {
@@ -2182,8 +2326,9 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     try {
         const hasV1 = R.files.some(f => /^META-INF\/.*\.SF$/i.test(f));
         let hasV2 = false;
-        const raw = new Uint8Array(arrayBuffer);
-        const searchStart = Math.max(0, raw.length - 4096);
+        const tail = new Uint8Array(await archiveBlob.slice(Math.max(0, archiveBlob.size - 4096)).arrayBuffer());
+        const raw = tail;
+        const searchStart = 0;
         const magic = [0x41,0x50,0x4B,0x20,0x53,0x69,0x67];
         for (let i = searchStart; i < raw.length - 7; i++) {
             if (raw[i]===magic[0]&&raw[i+1]===magic[1]&&raw[i+2]===magic[2]&&raw[i+3]===magic[3]&&raw[i+4]===magic[4]&&raw[i+5]===magic[5]&&raw[i+6]===magic[6]) { hasV2 = true; break; }
@@ -2204,17 +2349,28 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
         const dp = R.specialFiles.dex[i];
         try {
             onProgress(40 + Math.floor(10 * i / dexLimit), 'Parsing ' + dp);
-            const db = await readEntryBuffer(zipFiles.get(dp));
-            const parser = new DEXParser(db);
-            const parsed = parser.parse();
-            if (parsed) {
-                R.dexParsed.push(Object.assign({ name: dp, buf: db }, parsed));
-                allDexStrings.push(...parsed.strings);
-                buildSmaliTree(parsed.classes, R.smaliTree, R.dexParsed.length - 1);
-                R.dexFiles.push({ name: dp, classes: parsed.classes.length, methods: parsed.methods.length, strings: parsed.strings.length });
+            const dexEntry = zipFiles.get(dp);
+            const dexSize = Number(dexEntry.uncompressedSize || 0);
+            let parsed;
+            if (dexSize <= ARCHIVE_LIMITS.dexMemory) {
+                const db = await readEntryLimited(dexEntry, ARCHIVE_LIMITS.dexMemory, 'DEX file');
+                parsed = new DEXParser(db).parse();
+                if (parsed) {
+                    R.dexParsed.push(Object.assign({ name: dp, buf: db }, parsed));
+                    allDexStrings.push(...parsed.strings);
+                    buildSmaliTree(parsed.classes, R.smaliTree, R.dexParsed.length - 1);
+                    R.dexFiles.push({ name: dp, classes: parsed.classes.length, methods: parsed.methods.length, strings: parsed.strings.length });
+                }
             } else {
-                R.warnings.push(dp + ' could not be parsed');
+                const staged = await stageDexInOPFS(dexEntry, dp);
+                try {
+                    const strings = await parseDexStringsFromFile(staged.file);
+                    allDexStrings.push(...strings);
+                    R.dexFiles.push({ name: dp, classes: 0, methods: 0, strings: strings.length, diskBacked: true });
+                    R.warnings.push(dp + ' was staged in browser private storage and its DEX string table was scanned. Full bytecode decompilation is not yet available for DEX files over ' + formatSize(ARCHIVE_LIMITS.dexMemory) + '.');
+                } finally { await staged.cleanup(); }
             }
+            if (!parsed && dexSize <= ARCHIVE_LIMITS.dexMemory) R.warnings.push(dp + ' could not be parsed');
         } catch (e) { R.warnings.push(dp + ' parse error: ' + e.message); }
     }
 
@@ -2222,7 +2378,7 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     const arscFile = zipFiles.get('resources.arsc');
     if (arscFile) {
         try {
-            const arscBuf = await readEntryBuffer(arscFile);
+            const arscBuf = await readEntryLimited(arscFile, ARCHIVE_LIMITS.resources, 'resources.arsc');
             const arscData = parseArsc(arscBuf);
             if (arscData) {
                 R.arscData = arscData;
@@ -2277,31 +2433,32 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     const textFiles = priorityFiles.concat(otherTextFiles).slice(0, 120);
     for (const path of textFiles) {
         try {
+            const entry = zipFiles.get(path);
             const ext = path.split('.').pop().toLowerCase();
-            let c;
-            if (ext === 'xml') {
-                const ab = await readEntryBuffer(zipFiles.get(path));
-                const bytes = new Uint8Array(ab);
-                if (bytes.length > 4 && bytes[0] === 0x03 && bytes[1] === 0x00) {
+            const size = Number(entry.uncompressedSize || 0);
+            if (ext === 'xml' && size <= ARCHIVE_LIMITS.smallEntry) {
+                const ab = await readEntryLimited(entry, ARCHIVE_LIMITS.smallEntry, 'XML entry');
+                let content;
+                if (ab.byteLength > 4 && new Uint8Array(ab)[0] === 0x03 && new Uint8Array(ab)[1] === 0x00) {
                     try {
-                        const parser = new AXMLParser(ab);
-                        const parsed = parser.parse();
-                        if (parsed) c = '<?xml version="1.0" encoding="utf-8"?>\n' + xmlToStr(parsed);
-                    } catch (pe) {}
+                        const parsed = new AXMLParser(ab).parse();
+                        if (parsed) content = '<?xml version="1.0" encoding="utf-8"?>\n' + xmlToStr(parsed);
+                    } catch (parseError) {}
                 }
-                if (!c) c = new TextDecoder('utf-8', { fatal: false }).decode(ab);
+                if (!content) content = new TextDecoder('utf-8', { fatal: false }).decode(ab);
+                R.fileContents[path] = content.slice(0, ARCHIVE_LIMITS.textPreview);
+                R.findings.push(...analyzeContent(content, path, ANDROID_RULES));
+                if (Entropy) {
+                    for (const secret of Entropy.detectSecrets(content)) {
+                        secret.file = path;
+                        secret.line = (content.slice(0, secret.index).match(/\n/g) || []).length + 1;
+                        R.findings.push(secret);
+                    }
+                }
             } else {
-                c = await readEntryText(zipFiles.get(path));
-            }
-            R.fileContents[path] = c;
-            R.findings.push(...analyzeContent(c, path, ANDROID_RULES));
-            if (Entropy) {
-                const secrets = Entropy.detectSecrets(c);
-                for (const s of secrets) {
-                    s.file = path;
-                    s.line = (c.substring(0, s.index).match(/\n/g) || []).length + 1;
-                    R.findings.push(s);
-                }
+                const streamed = await scanTextEntry(entry, path, R.findings, Entropy);
+                if (streamed.preview) R.fileContents[path] = streamed.preview;
+                if (streamed.truncated) R.warnings.push(path + ' was streamed but content scanning was capped at ' + formatSize(ARCHIVE_LIMITS.textScan) + ' per entry.');
             }
         } catch (e) { R.warnings.push('Failed to scan ' + path + ': ' + (e.message || e)); }
     }
