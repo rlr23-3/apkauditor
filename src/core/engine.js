@@ -2266,6 +2266,10 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     for (const entry of zipEntries) {
         const path = entry.filename;
         if (entry.directory) continue;
+        if (!path || path.length > 2048 || path.split('/').length > 64) {
+            R.warnings.push('Skipped an archive entry with an unsafe or excessively deep path');
+            continue;
+        }
         R.files.push(path);
         const ext = path.split('.').pop().toLowerCase();
         if (ext === 'dex') R.specialFiles.dex.push(path);
