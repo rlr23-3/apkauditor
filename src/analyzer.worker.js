@@ -2,6 +2,8 @@ self.IPAA = self.IPAA || {};
 try {
     importScripts(
         '../lib/zip.min.js',
+        '../lib/sha256.min.js',
+        '../lib/md5.min.js',
         'core/entropy.js',
         'core/engine.js'
     );
