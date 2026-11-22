@@ -42,7 +42,7 @@ lib/
   jspdf.umd.min.js
 ```
 
-Analysis runs in a Web Worker, so the UI stays responsive while a large APK is being parsed. If the worker fails to spawn, the page transparently falls back to running on the main thread.
+Analysis runs in a Web Worker, so the UI stays responsive while an APK is being parsed. The selected `File` is passed to the worker and converted to an `ArrayBuffer` there, avoiding an additional full-size buffer copy on the main thread. If the worker cannot be used, the page falls back to the main thread.
 
 ## Tabs
 
@@ -92,7 +92,7 @@ Toggle button in the header cycles dark ↔ light. The choice is stored in local
 
 ## Privacy
 
-The APK is read into an ArrayBuffer with the File API, transferred to the Web Worker, parsed in memory, and discarded when you close the tab. There is no network call. The page has a strict CSP that disallows it. You can run it offline.
+The selected APK stays on your device. Its `File` handle is passed to the Web Worker and read into an `ArrayBuffer` there for parsing; no APK bytes are uploaded. Analysis data is held in memory and discarded when you close the tab. There is no APK upload or telemetry. You can run it offline.
 
 ## Coverage
 
@@ -109,6 +109,7 @@ The APK is read into an ArrayBuffer with the File API, transferred to the Web Wo
 
 ## Limits
 
+- APK/ZIP uploads are accepted up to **16 GiB**. This is a file-size ceiling, not a guarantee that a browser can process an archive of that size: the current JSZip-based analyzer still requires the archive and extracted content in memory, and actual limits depend on the browser, operating system, and available RAM.
 - Each rule emits at most 20 instances per file, capped at 500 per rule globally
 - Up to 5000 DEX classes are scanned for rule patterns (the parser still reads them all)
 - Resource files larger than 300 KB are sampled rather than scanned end-to-end
