@@ -14,9 +14,15 @@ const STRIP_KEYS = new Set(['buf', 'data', '_data', 'dexParsed', 'manifest', 'sm
 self.onmessage = async (e) => {
     const msg = e.data;
     if (!msg || !msg.type) return;
-    if (msg.type === 'analyze') {
+    if (msg.type === 'analyze-file' || msg.type === 'analyze') {
         try {
-            const result = await self.APKA.analyzeAPK(msg.buffer, msg.fileMeta, {
+            const buffer = msg.type === 'analyze-file'
+                ? await msg.file.arrayBuffer()
+                : msg.buffer;
+            if (!(buffer instanceof ArrayBuffer)) {
+                throw new Error('Could not read the selected APK as an ArrayBuffer');
+            }
+            const result = await self.APKA.analyzeAPK(buffer, msg.fileMeta, {
                 onProgress: (percent, text) => self.postMessage({ type: 'progress', data: { percent, text } })
             });
             self.postMessage({ type: 'result', data: sanitize(result) });
