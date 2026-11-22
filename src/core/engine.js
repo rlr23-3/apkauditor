@@ -2103,23 +2103,33 @@ async function scanTextEntry(entry, path, findings, entropyApi) {
     const maxScan = ARCHIVE_LIMITS.textScan, overlap = ARCHIVE_LIMITS.overlap;
     const scanWindow = text => {
         if (!text) return;
-        for (const finding of analyzeContent(text, path, ANDROID_RULES)) {
-            const key = [finding.ruleId, finding.line + baseLine - 1, finding.match].join('|');
-            if (seen.has(key)) continue;
-            seen.add(key);
-            finding.line = (finding.line || 1) + baseLine - 1;
-            findings.push(finding);
-        }
-        if (entropyApi) {
-            for (const secret of entropyApi.detectSecrets(text)) {
-                const localLine = (text.slice(0, secret.index).match(/\n/g) || []).length + 1;
-                const key = [secret.ruleId, baseLine + localLine - 1, secret.match].join('|');
+        let segmentStart = 0;
+        while (segmentStart < text.length) {
+            const segmentEnd = Math.min(text.length, segmentStart + 200000);
+            const segment = text.slice(segmentStart, segmentEnd);
+            const segmentLine = baseLine + (text.slice(0, segmentStart).match(/\n/g) || []).length;
+            for (const finding of analyzeContent(segment, path, ANDROID_RULES)) {
+                const line = segmentLine + (finding.line || 1) - 1;
+                const key = [finding.ruleId, line, finding.match].join('|');
                 if (seen.has(key)) continue;
                 seen.add(key);
-                secret.file = path;
-                secret.line = baseLine + localLine - 1;
-                findings.push(secret);
+                finding.line = line;
+                findings.push(finding);
             }
+            if (entropyApi) {
+                for (const secret of entropyApi.detectSecrets(segment)) {
+                    const localLine = (segment.slice(0, secret.index).match(/\n/g) || []).length + 1;
+                    const line = segmentLine + localLine - 1;
+                    const key = [secret.ruleId, line, secret.match].join('|');
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    secret.file = path;
+                    secret.line = line;
+                    findings.push(secret);
+                }
+            }
+            if (segmentEnd >= text.length) break;
+            segmentStart = Math.max(segmentStart + 1, segmentEnd - overlap);
         }
     };
     const sink = new WritableStream({
