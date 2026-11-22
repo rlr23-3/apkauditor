@@ -26,6 +26,8 @@ const State = {
     explorerTree: null,
     currentOpenFile: null,
     currentOpenBytes: null,
+    currentOpenEntry: null,
+    currentOpenRequest: 0,
 };
 
 function esc(text) {
@@ -837,9 +839,10 @@ function renderCert(r) {
 function renderExplorer(r) {
     State.explorerFiles = r.files || [];
     State.explorerTree = r.fileTree || {};
+    State.treeNodesRendered = 0;
     const treeContainer = $('#fileTree');
     treeContainer.innerHTML = buildTree(State.explorerTree, '');
-    $('#totalFileCount') && ($('#totalFileCount').textContent = State.explorerFiles.length + ' files');
+    $('#totalFileCount') && ($('#totalFileCount').textContent = State.explorerFiles.length + ' files' + (State.explorerFiles.length > 20000 ? ' · first 20,000 shown in tree; search covers all' : ''));
     populateQuickAccess(r);
     setupExplorerSearch();
     treeContainer.onclick = onTreeClick;
@@ -860,12 +863,15 @@ function onTreeClick(e) {
 
 function buildTree(tree, prefix) {
     let out = '';
+    if (State.treeNodesRendered == null) State.treeNodesRendered = 0;
     const entries = Object.entries(tree).filter(([k]) => !k.startsWith('_')).sort((a, b) => {
         const aDir = a[1]._type === 'dir', bDir = b[1]._type === 'dir';
         if (aDir !== bDir) return aDir ? -1 : 1;
         return a[0].localeCompare(b[0]);
     });
     for (const [name, node] of entries) {
+        if (State.treeNodesRendered >= 20000) break;
+        State.treeNodesRendered++;
         if (node._type === 'dir') {
             const count = countFiles(node);
             out += '<div class="tree-folder" role="treeitem" aria-expanded="false">' +
@@ -1076,6 +1082,8 @@ async function openFile(path) {
     if (!path) return;
     State.currentOpenFile = path;
     State.currentOpenBytes = null;
+    State.currentOpenEntry = null;
+    const requestId = ++State.currentOpenRequest;
     $('#currentFilePath').textContent = path;
     const dl = $('#downloadFileBtn'); if (dl) dl.disabled = true;
     const viewer = $('#fileViewer');
@@ -1105,19 +1113,65 @@ async function openFile(path) {
             viewer.innerHTML = '<div class="no-data">File not found in archive: ' + esc(path) + '</div>';
             return;
         }
-        const data = await entry.getData(new zip.Uint8ArrayWriter());
+        State.currentOpenEntry = entry;
+        const chunks = [];
+        let retained = 0;
+        const previewLimit = 4 * 1024 * 1024;
+        await entry.getData(new WritableStream({
+            write(chunk) {
+                if (requestId !== State.currentOpenRequest) return;
+                const keep = Math.min(chunk.byteLength, previewLimit - retained);
+                if (keep > 0) {
+                    chunks.push(chunk.slice(0, keep));
+                    retained += keep;
+                }
+            }
+        }));
+        if (requestId !== State.currentOpenRequest) return;
+        const data = new Uint8Array(retained);
+        let offset = 0;
+        for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }
         State.currentOpenBytes = data;
-        const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
         if (dl) dl.disabled = false;
-        renderFile(viewer, path, buffer);
+        const declaredSize = Number(entry.uncompressedSize || 0);
+        if (declaredSize > previewLimit) {
+            viewer.innerHTML = '<div class="no-data">Preview limited to the first 4 MiB of ' + esc(fmtSize(declaredSize)) + '. Use Download to save the complete entry without loading it all into memory.</div>';
+            return;
+        }
+        renderFile(viewer, path, data.buffer);
     } catch (e) {
         viewer.innerHTML = '<div class="no-data">' + esc(e.message || 'Unable to read file') + '</div>';
     }
 }
 
-function downloadCurrentFile() {
-    if (!State.currentOpenBytes || !State.currentOpenFile) return;
-    const blob = new Blob([State.currentOpenBytes]);
+async function downloadCurrentFile() {
+    if (!State.currentOpenFile) return;
+    const entry = State.currentOpenEntry;
+    if (entry && typeof window.showSaveFilePicker === 'function') {
+        let handle;
+        try {
+            handle = await window.showSaveFilePicker({ suggestedName: State.currentOpenFile.split('/').pop() });
+            const writable = await handle.createWritable();
+            await entry.getData(writable);
+            toast('File saved using streaming extraction.', 'success');
+            return;
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+            toast('Streaming download failed: ' + (error.message || error), 'error');
+            return;
+        }
+    }
+    if (entry && Number(entry.uncompressedSize || 0) > 64 * 1024 * 1024) {
+        toast('This browser does not support streaming file save. Use a browser with the File System Access API to download entries larger than 64 MiB.', 'error');
+        return;
+    }
+    if (!State.currentOpenBytes) return;
+    let bytes = State.currentOpenBytes;
+    if (entry) {
+        try { bytes = await entry.getData(new zip.Uint8ArrayWriter()); }
+        catch (error) { toast('Download failed: ' + error.message, 'error'); return; }
+    }
+    const blob = new Blob([bytes]);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = State.currentOpenFile.split('/').pop();
