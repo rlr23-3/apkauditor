@@ -2080,7 +2080,7 @@ function generateSmaliView(cls, buf, allStrings, allTypes, allMethods, allFields
     return L.join('\n');
 }
 
-async function analyzeAPK(arrayBuffer, fileMeta, opts) {
+async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     opts = opts || {};
     const onProgress = opts.onProgress || (() => {});
     const Entropy = root.IPAA && root.IPAA.Entropy;
@@ -2098,16 +2098,32 @@ async function analyzeAPK(arrayBuffer, fileMeta, opts) {
     };
 
     onProgress(5, 'Reading APK');
+    const archiveBlob = fileOrBuffer instanceof Blob
+        ? fileOrBuffer
+        : new Blob([fileOrBuffer], { type: 'application/vnd.android.package-archive' });
+    // Hashing and APK signature inspection still require a contiguous buffer;
+    // zip.js reads the archive entries directly from the original Blob.
+    const arrayBuffer = fileOrBuffer instanceof ArrayBuffer
+        ? fileOrBuffer
+        : await archiveBlob.arrayBuffer();
     R.appInfo.sha256 = await sha256hex(arrayBuffer);
     R.appInfo.md5 = await md5hex(arrayBuffer);
 
-    onProgress(14, 'Extracting');
-    if (typeof JSZip === 'undefined') throw new Error('JSZip not loaded');
-    const zip = await JSZip.loadAsync(arrayBuffer);
+    onProgress(14, 'Indexing archive');
+    if (typeof zip === 'undefined') throw new Error('zip.js not loaded');
+    const zipReader = new zip.ZipReader(new zip.BlobReader(archiveBlob));
+    const zipEntries = await zipReader.getEntries();
+    const zipFiles = new Map(zipEntries.map(entry => [entry.filename, entry]));
+    const readEntryBuffer = async entry => {
+        const bytes = await entry.getData(new zip.Uint8ArrayWriter());
+        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    };
+    const readEntryText = async entry => entry.getData(new zip.TextWriter());
 
     onProgress(18, 'Indexing files');
-    for (const [path, entry] of Object.entries(zip.files)) {
-        if (entry.dir) continue;
+    for (const entry of zipEntries) {
+        const path = entry.filename;
+        if (entry.directory) continue;
         R.files.push(path);
         const ext = path.split('.').pop().toLowerCase();
         if (ext === 'dex') R.specialFiles.dex.push(path);
@@ -2119,7 +2135,7 @@ async function analyzeAPK(arrayBuffer, fileMeta, opts) {
         for (let i = 0; i < parts.length; i++) {
             const p = parts[i];
             if (i === parts.length - 1) {
-                const sz = entry._data && entry._data.uncompressedSize || (entry.options && entry.options.uncompressedSize) || 0;
+                const sz = entry.uncompressedSize || (entry.data && entry.data.uncompressedSize) || 0;
                 cur[p] = { _type: 'file', _path: path, _size: sz };
             } else {
                 if (!cur[p]) cur[p] = { _type: 'dir' };
@@ -2129,10 +2145,10 @@ async function analyzeAPK(arrayBuffer, fileMeta, opts) {
     }
 
     onProgress(24, 'Parsing AndroidManifest.xml');
-    const mf = zip.file('AndroidManifest.xml');
+    const mf = zipFiles.get('AndroidManifest.xml');
     if (mf) {
         try {
-            const mb = await mf.async('arraybuffer');
+            const mb = await readEntryBuffer(mf);
             const parser = new AXMLParser(mb);
             R.manifest = parser.parse();
             if (R.manifest) {
@@ -2147,10 +2163,10 @@ async function analyzeAPK(arrayBuffer, fileMeta, opts) {
     }
 
     onProgress(32, 'Analyzing certificate');
-    for (const path of Object.keys(zip.files)) {
+    for (const path of zipFiles.keys()) {
         if (/META-INF\/.+\.(RSA|DSA|EC)$/i.test(path)) {
             try {
-                const cb = await zip.file(path).async('arraybuffer');
+                const cb = await readEntryBuffer(zipFiles.get(path));
                 const cp = new CertParser(cb);
                 R.certInfo = cp.findCert();
                 if (R.certInfo) {
@@ -2188,7 +2204,7 @@ async function analyzeAPK(arrayBuffer, fileMeta, opts) {
         const dp = R.specialFiles.dex[i];
         try {
             onProgress(40 + Math.floor(10 * i / dexLimit), 'Parsing ' + dp);
-            const db = await zip.file(dp).async('arraybuffer');
+            const db = await readEntryBuffer(zipFiles.get(dp));
             const parser = new DEXParser(db);
             const parsed = parser.parse();
             if (parsed) {
@@ -2203,10 +2219,10 @@ async function analyzeAPK(arrayBuffer, fileMeta, opts) {
     }
 
     onProgress(54, 'Parsing resources');
-    const arscFile = zip.file('resources.arsc');
+    const arscFile = zipFiles.get('resources.arsc');
     if (arscFile) {
         try {
-            const arscBuf = await arscFile.async('arraybuffer');
+            const arscBuf = await readEntryBuffer(arscFile);
             const arscData = parseArsc(arscBuf);
             if (arscData) {
                 R.arscData = arscData;
@@ -2264,7 +2280,7 @@ async function analyzeAPK(arrayBuffer, fileMeta, opts) {
             const ext = path.split('.').pop().toLowerCase();
             let c;
             if (ext === 'xml') {
-                const ab = await zip.file(path).async('arraybuffer');
+                const ab = await readEntryBuffer(zipFiles.get(path));
                 const bytes = new Uint8Array(ab);
                 if (bytes.length > 4 && bytes[0] === 0x03 && bytes[1] === 0x00) {
                     try {
@@ -2275,7 +2291,7 @@ async function analyzeAPK(arrayBuffer, fileMeta, opts) {
                 }
                 if (!c) c = new TextDecoder('utf-8', { fatal: false }).decode(ab);
             } else {
-                c = await zip.file(path).async('string');
+                c = await readEntryText(zipFiles.get(path));
             }
             R.fileContents[path] = c;
             R.findings.push(...analyzeContent(c, path, ANDROID_RULES));
@@ -2333,6 +2349,7 @@ async function analyzeAPK(arrayBuffer, fileMeta, opts) {
     R.securityScore = computeScore(grouped, R);
 
     onProgress(100, 'Done');
+    await zipReader.close();
     return R;
 }
 
