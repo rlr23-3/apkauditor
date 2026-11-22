@@ -2106,10 +2106,21 @@ const ARCHIVE_LIMITS = Object.freeze({
 });
 
 async function readEntryLimited(entry, limit, label) {
-    const size = Number(entry.uncompressedSize || 0);
-    if (size > limit) throw new Error(label + ' exceeds the ' + formatSize(limit) + ' analysis limit');
-    const data = await entry.getData(new zip.Uint8ArrayWriter());
-    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+    const declared = Number(entry.uncompressedSize || 0);
+    if (declared > limit) throw new Error(label + ' exceeds the ' + formatSize(limit) + ' analysis limit');
+    const chunks = [];
+    let actual = 0;
+    await entry.getData(new WritableStream({
+        write(chunk) {
+            actual += chunk.byteLength;
+            if (actual > limit) throw new Error(label + ' exceeded the ' + formatSize(limit) + ' extraction limit');
+            chunks.push(chunk.slice());
+        }
+    }));
+    const output = new Uint8Array(actual);
+    let offset = 0;
+    for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.byteLength; }
+    return output.buffer;
 }
 
 async function scanTextEntry(entry, path, findings, entropyApi) {
@@ -2145,7 +2156,7 @@ async function scanTextEntry(entry, path, findings, entropyApi) {
             if (preview.length < ARCHIVE_LIMITS.textPreview) {
                 preview += part.slice(0, ARCHIVE_LIMITS.textPreview - preview.length);
             }
-            if (bytes > maxScan) return;
+            if (bytes > maxScan) throw new Error('ENTRY_SCAN_LIMIT');
             const windowText = carry + part;
             if (windowText) {
                 scanWindow(windowText);
@@ -2160,8 +2171,14 @@ async function scanTextEntry(entry, path, findings, entropyApi) {
             if (bytes <= maxScan) scanWindow(windowText);
         }
     });
-    await entry.getData(sink);
-    return { preview, bytes, truncated: bytes > maxScan };
+    let truncated = false;
+    try {
+        await entry.getData(sink);
+    } catch (error) {
+        if (!error || error.message !== 'ENTRY_SCAN_LIMIT') throw error;
+        truncated = true;
+    }
+    return { preview, bytes, truncated: truncated || bytes > maxScan };
 }
 
 async function stageDexInOPFS(entry, path) {
@@ -2172,12 +2189,23 @@ async function stageDexInOPFS(entry, path) {
     const dir = await rootDir.getDirectoryHandle('apk-auditor-temp', { create: true });
     const safeName = path.replace(/[^a-zA-Z0-9._-]/g, '_') + '-' + Date.now() + '.dex';
     const handle = await dir.getFileHandle(safeName, { create: true });
-    const writable = await handle.createWritable();
+    const fileWriter = await handle.createWritable();
+    let written = 0;
+    const maxDexBytes = 2 * 1024 * 1024 * 1024;
+    const boundedWriter = new WritableStream({
+        write(chunk) {
+            written += chunk.byteLength;
+            if (written > maxDexBytes) throw new Error('DEX exceeds the 2 GiB disk-staging limit');
+            return fileWriter.write(chunk);
+        },
+        close() { return fileWriter.close(); },
+        abort(reason) { return fileWriter.abort(reason); }
+    });
     try {
-        await entry.getData(writable);
+        await entry.getData(boundedWriter);
         return { file: await handle.getFile(), cleanup: () => dir.removeEntry(safeName).catch(() => {}) };
     } catch (error) {
-        await writable.abort(error).catch(() => {});
+        await fileWriter.abort(error).catch(() => {});
         await dir.removeEntry(safeName).catch(() => {});
         throw error;
     }
@@ -2342,6 +2370,7 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
     onProgress(40, 'Parsing DEX files');
     const allDexStrings = [];
     const dexLimit = Math.min(R.specialFiles.dex.length, 10);
+    let dexMemoryRemaining = ARCHIVE_LIMITS.dexMemory;
     for (let i = 0; i < dexLimit; i++) {
         const dp = R.specialFiles.dex[i];
         try {
@@ -2349,8 +2378,9 @@ async function analyzeAPK(fileOrBuffer, fileMeta, opts) {
             const dexEntry = zipFiles.get(dp);
             const dexSize = Number(dexEntry.uncompressedSize || 0);
             let parsed;
-            if (dexSize <= ARCHIVE_LIMITS.dexMemory) {
-                const db = await readEntryLimited(dexEntry, ARCHIVE_LIMITS.dexMemory, 'DEX file');
+            if (dexSize <= dexMemoryRemaining) {
+                const db = await readEntryLimited(dexEntry, dexMemoryRemaining, 'DEX file');
+                dexMemoryRemaining -= db.byteLength;
                 parsed = new DEXParser(db).parse();
                 if (parsed) {
                     R.dexParsed.push(Object.assign({ name: dp, buf: db }, parsed));
