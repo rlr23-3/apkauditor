@@ -2141,15 +2141,12 @@ async function scanTextEntry(entry, path, findings, entropyApi) {
     const sink = new WritableStream({
         write(chunk) {
             bytes += chunk.byteLength;
+            const part = decoder.decode(chunk, { stream: true });
             if (preview.length < ARCHIVE_LIMITS.textPreview) {
-                const part = decoder.decode(chunk, { stream: true });
                 preview += part.slice(0, ARCHIVE_LIMITS.textPreview - preview.length);
-            } else {
-                decoder.decode(chunk, { stream: true });
             }
             if (bytes > maxScan) return;
-            const fresh = decoder.decode(new Uint8Array(0), { stream: true });
-            const windowText = carry + fresh;
+            const windowText = carry + part;
             if (windowText) {
                 scanWindow(windowText);
                 const keepFrom = Math.max(0, windowText.length - overlap);
