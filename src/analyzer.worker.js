@@ -1,7 +1,9 @@
 self.IPAA = self.IPAA || {};
 try {
     importScripts(
-        '../lib/jszip.min.js',
+        '../lib/zip.min.js',
+        '../lib/sha256.min.js',
+        '../lib/md5.min.js',
         'core/entropy.js',
         'core/engine.js'
     );
@@ -14,9 +16,13 @@ const STRIP_KEYS = new Set(['buf', 'data', '_data', 'dexParsed', 'manifest', 'sm
 self.onmessage = async (e) => {
     const msg = e.data;
     if (!msg || !msg.type) return;
-    if (msg.type === 'analyze') {
+    if (msg.type === 'analyze-file' || msg.type === 'analyze') {
         try {
-            const result = await self.APKA.analyzeAPK(msg.buffer, msg.fileMeta, {
+            const input = msg.type === 'analyze-file' ? msg.file : msg.buffer;
+            if (!(input instanceof Blob) && !(input instanceof ArrayBuffer)) {
+                throw new Error('Could not read the selected APK file');
+            }
+            const result = await self.APKA.analyzeAPK(input, msg.fileMeta, {
                 onProgress: (percent, text) => self.postMessage({ type: 'progress', data: { percent, text } })
             });
             self.postMessage({ type: 'result', data: sanitize(result) });

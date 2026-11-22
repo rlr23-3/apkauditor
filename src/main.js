@@ -7,6 +7,9 @@ const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
 
 const SEVS = ['issue', 'info', 'secure'];
 
+// Accepted upload ceiling. Actual processable size depends on browser/device memory.
+const MAX_APK_SIZE_BYTES = 16 * 1024 * 1024 * 1024;
+
 const State = {
     currentResults: null,
     currentFile: null,
@@ -23,6 +26,8 @@ const State = {
     explorerTree: null,
     currentOpenFile: null,
     currentOpenBytes: null,
+    currentOpenEntry: null,
+    currentOpenRequest: 0,
 };
 
 function esc(text) {
@@ -92,21 +97,26 @@ async function analyzeFile(file) {
     document.body.classList.add('analyzing');
     showProgress(0, 'Initializing…');
     State.currentFile = file;
+    if (State.viewerZip && State.viewerZip.reader) State.viewerZip.reader.close().catch(() => {});
     State.viewerZip = null;
-    const arrayBuffer = await file.arrayBuffer();
+    if (file.size > MAX_APK_SIZE_BYTES) {
+        throw new Error('File exceeds the 16 GiB upload limit.');
+    }
     const fileMeta = { name: file.name, size: file.size, lastModified: file.lastModified };
 
     if (!State.worker) State.worker = setupWorker();
 
-    let workerBuffer = arrayBuffer;
-    if (State.worker && !State.workerFailed) {
-        workerBuffer = arrayBuffer.slice(0);
-    }
-
     return new Promise((resolve, reject) => {
+        // Read on the main thread only when the worker is unavailable or cannot accept the File.
+        // Sending the File avoids a second full-size ArrayBuffer copy for large APKs.
+        const runOnMainThreadFallback = () => {
+            Promise.resolve()
+                .then(() => runOnMainThread(file, fileMeta))
+                .then(resolve, reject);
+        };
         const useWorker = State.worker && !State.workerFailed;
         if (!useWorker) {
-            runOnMainThread(arrayBuffer, fileMeta).then(resolve, reject);
+            runOnMainThreadFallback();
             return;
         }
         const w = State.worker;
@@ -124,36 +134,40 @@ async function analyzeFile(file) {
                 console.warn('Worker fatal, falling back to main thread:', data.error);
                 w.removeEventListener('message', onMsg);
                 State.workerFailed = true;
-                runOnMainThread(arrayBuffer, fileMeta).then(resolve, reject);
+                runOnMainThreadFallback();
             }
         };
         w.addEventListener('message', onMsg);
         try {
-            w.postMessage({ type: 'analyze', buffer: workerBuffer, fileMeta }, [workerBuffer]);
+            w.postMessage({ type: 'analyze-file', file, fileMeta });
         } catch (e) {
             w.removeEventListener('message', onMsg);
             State.workerFailed = true;
-            runOnMainThread(arrayBuffer, fileMeta).then(resolve, reject);
+            runOnMainThreadFallback();
         }
     });
 }
-
-async function runOnMainThread(arrayBuffer, fileMeta) {
+async function runOnMainThread(file, fileMeta) {
     if (!window.APKA || typeof window.APKA.analyzeAPK !== 'function') {
         throw new Error('Engine not loaded');
     }
-    return window.APKA.analyzeAPK(arrayBuffer, fileMeta, {
+    return window.APKA.analyzeAPK(file, fileMeta, {
         onProgress: (percent, text) => showProgress(percent || 0, text || '…'),
     });
 }
 
 async function getViewerZip() {
     if (State.viewerZip) return State.viewerZip;
-    if (!State.currentFile) return null;
-    if (typeof JSZip === 'undefined') return null;
-    const buf = await State.currentFile.arrayBuffer();
-    State.viewerZip = await JSZip.loadAsync(buf);
-    return State.viewerZip;
+    if (!State.currentFile || typeof zip === 'undefined') return null;
+    const reader = new zip.ZipReader(new zip.BlobReader(State.currentFile));
+    try {
+        const entries = await reader.getEntries();
+        State.viewerZip = { reader, entries: new Map(entries.map(entry => [entry.filename, entry])) };
+        return State.viewerZip;
+    } catch (error) {
+        await reader.close();
+        throw error;
+    }
 }
 
 function showProgress(pct, text, payload) {
@@ -182,6 +196,9 @@ async function startAnalysis(file) {
     if (!file) return;
     if (!/\.apk$/i.test(file.name) && !/\.zip$/i.test(file.name)) {
         toast('Please select a .apk or .zip file', 'error'); return;
+    }
+    if (file.size > MAX_APK_SIZE_BYTES) {
+        toast('File exceeds the 16 GiB upload limit.', 'error'); return;
     }
     try {
         const results = await analyzeFile(file);
@@ -822,9 +839,10 @@ function renderCert(r) {
 function renderExplorer(r) {
     State.explorerFiles = r.files || [];
     State.explorerTree = r.fileTree || {};
+    State.treeNodesRendered = 0;
     const treeContainer = $('#fileTree');
     treeContainer.innerHTML = buildTree(State.explorerTree, '');
-    $('#totalFileCount') && ($('#totalFileCount').textContent = State.explorerFiles.length + ' files');
+    $('#totalFileCount') && ($('#totalFileCount').textContent = State.explorerFiles.length + ' files' + (State.explorerFiles.length > 20000 ? ' · first 20,000 shown in tree; search covers all' : ''));
     populateQuickAccess(r);
     setupExplorerSearch();
     treeContainer.onclick = onTreeClick;
@@ -845,12 +863,15 @@ function onTreeClick(e) {
 
 function buildTree(tree, prefix) {
     let out = '';
+    if (State.treeNodesRendered == null) State.treeNodesRendered = 0;
     const entries = Object.entries(tree).filter(([k]) => !k.startsWith('_')).sort((a, b) => {
         const aDir = a[1]._type === 'dir', bDir = b[1]._type === 'dir';
         if (aDir !== bDir) return aDir ? -1 : 1;
         return a[0].localeCompare(b[0]);
     });
     for (const [name, node] of entries) {
+        if (State.treeNodesRendered >= 20000) break;
+        State.treeNodesRendered++;
         if (node._type === 'dir') {
             const count = countFiles(node);
             out += '<div class="tree-folder" role="treeitem" aria-expanded="false">' +
@@ -1061,6 +1082,8 @@ async function openFile(path) {
     if (!path) return;
     State.currentOpenFile = path;
     State.currentOpenBytes = null;
+    State.currentOpenEntry = null;
+    const requestId = ++State.currentOpenRequest;
     $('#currentFilePath').textContent = path;
     const dl = $('#downloadFileBtn'); if (dl) dl.disabled = true;
     const viewer = $('#fileViewer');
@@ -1085,23 +1108,84 @@ async function openFile(path) {
             viewer.innerHTML = '<div class="no-data">Drop the APK again to enable the inline viewer (analysis results remain loaded).</div>';
             return;
         }
-        const entry = zip.file(path);
+        const entry = zip.entries.get(path);
         if (!entry) {
             viewer.innerHTML = '<div class="no-data">File not found in archive: ' + esc(path) + '</div>';
             return;
         }
-        const data = await entry.async('arraybuffer');
-        State.currentOpenBytes = new Uint8Array(data);
+        State.currentOpenEntry = entry;
+        const chunks = [];
+        let retained = 0;
+        const previewLimit = 4 * 1024 * 1024;
+        let previewTruncated = false;
+        try {
+            await entry.getData(new WritableStream({
+                write(chunk) {
+                    if (requestId !== State.currentOpenRequest) throw new Error('PREVIEW_CANCELLED');
+                    const keep = Math.min(chunk.byteLength, previewLimit - retained);
+                    if (keep > 0) {
+                        chunks.push(chunk.slice(0, keep));
+                        retained += keep;
+                    }
+                    if (keep < chunk.byteLength) {
+                        previewTruncated = true;
+                        throw new Error('PREVIEW_LIMIT');
+                    }
+                }
+            }));
+        } catch (previewError) {
+            if (!previewError || !['PREVIEW_LIMIT', 'PREVIEW_CANCELLED'].includes(previewError.message)) throw previewError;
+        }
+        if (requestId !== State.currentOpenRequest) return;
+        const data = new Uint8Array(retained);
+        let offset = 0;
+        for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.byteLength; }
+        State.currentOpenBytes = data;
         if (dl) dl.disabled = false;
-        renderFile(viewer, path, data);
+        const declaredSize = Number(entry.uncompressedSize || 0);
+        if (declaredSize > previewLimit || previewTruncated) {
+            viewer.innerHTML = '<div class="no-data">Preview limited to the first 4 MiB of ' + esc(fmtSize(declaredSize)) + '. Use Download to save the complete entry without loading it all into memory.</div>';
+            return;
+        }
+        renderFile(viewer, path, data.buffer);
     } catch (e) {
         viewer.innerHTML = '<div class="no-data">' + esc(e.message || 'Unable to read file') + '</div>';
     }
 }
 
-function downloadCurrentFile() {
-    if (!State.currentOpenBytes || !State.currentOpenFile) return;
-    const blob = new Blob([State.currentOpenBytes]);
+async function downloadCurrentFile() {
+    if (!State.currentOpenFile) return;
+    const entry = State.currentOpenEntry;
+    if (entry && typeof window.showSaveFilePicker === 'function') {
+        let handle;
+        try {
+            handle = await window.showSaveFilePicker({ suggestedName: State.currentOpenFile.split('/').pop() });
+            const fileWritable = await handle.createWritable();
+            const sink = new WritableStream({
+                write(chunk) { return fileWritable.write(chunk); },
+                close() { return fileWritable.close(); },
+                abort(reason) { return fileWritable.abort(reason); }
+            });
+            await entry.getData(sink);
+            toast('File saved using streaming extraction.', 'success');
+            return;
+        } catch (error) {
+            if (error && error.name === 'AbortError') return;
+            toast('Streaming download failed: ' + (error.message || error), 'error');
+            return;
+        }
+    }
+    if (entry && Number(entry.uncompressedSize || 0) > 64 * 1024 * 1024) {
+        toast('This browser does not support streaming file save. Use a browser with the File System Access API to download entries larger than 64 MiB.', 'error');
+        return;
+    }
+    if (!State.currentOpenBytes) return;
+    let bytes = State.currentOpenBytes;
+    if (entry) {
+        try { bytes = await entry.getData(new zip.Uint8ArrayWriter()); }
+        catch (error) { toast('Download failed: ' + error.message, 'error'); return; }
+    }
+    const blob = new Blob([bytes]);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = State.currentOpenFile.split('/').pop();

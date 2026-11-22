@@ -12,16 +12,16 @@ Try it: [apkauditor.com](https://apkauditor.com)
 
 ## What it actually does
 
-It runs everything client-side. The APK ZIP is read with JSZip, then:
+It runs everything client-side. The APK ZIP is indexed with zip.js using a Blob-backed reader, then:
 
-- **DEX parsing** reads the header, string pool, type IDs, method IDs, class defs, and bytecode. Up to 10 DEX files are supported (classes.dex through classes10.dex).
+- **DEX parsing** parses in-memory DEX files up to a 256 MiB aggregate budget. Larger DEX files are staged in Origin Private File System (OPFS) and their string tables are read by bounded random-access slices; full bytecode decompilation for those large files is explicitly skipped with a warning. Up to 10 DEX files are considered.
 - **AXML parser** decodes the binary AndroidManifest into XML so you can read it.
 - **PKCS#7 parser** walks the signing certificate DER tree to extract subject, issuer, algorithm, validity, and fingerprint.
 - **APK Signing Block scan** looks for the v2/v3 magic in the trailing bytes.
 - **Resource decoder** reads compiled `resources.arsc` enough to flag hardcoded secrets in string resources.
 - **Tracker detection** matches DEX strings against known SDK fingerprints (Firebase, AdMob, Crashlytics, Branch, and 30+ others).
 - **Rule engine** applies 80+ static rules covering crypto, network, manifest, WebView, storage, and code patterns. Each finding is tagged with CWE, OWASP Mobile Top 10, and MASVS.
-- **Entropy-aware secret detection** runs Shannon entropy over candidate strings to suppress noisy false positives. Vendor regexes for AWS, Stripe, GitHub, Slack, Google API keys, JWT, PEM blocks, Twilio, and more.
+- **Entropy-aware secret detection** runs Shannon entropy over candidate strings to suppress noisy false positives. Text entries are decompressed into bounded chunks with a 64 KiB overlap so matches crossing chunk boundaries can still be found. Vendor regexes cover AWS, Stripe, GitHub, Slack, Google API keys, JWT, PEM blocks, Twilio, and more.
 
 ## Architecture (v3)
 
@@ -38,11 +38,18 @@ src/
     export.js          JSON / CSV / SARIF 2.1 export
     pdf.js             Printable PDF audit report
 lib/
-  jszip.min.js
+  zip.min.js
+  zipjs.LICENSE.txt
+  sha256.min.js         Incremental SHA-256
+  md5.min.js            Incremental MD5
   jspdf.umd.min.js
 ```
 
-Analysis runs in a Web Worker, so the UI stays responsive while a large APK is being parsed. If the worker fails to spawn, the page transparently falls back to running on the main thread.
+Analysis runs in a Web Worker, so the UI stays responsive while an APK is being parsed. The selected `File` is passed directly to the worker. zip.js indexes the central directory through a Blob-backed random-access reader. SHA-256 and MD5 are updated incrementally from the File stream; the APK is no longer copied into one full-size hash buffer. Signing-block detection reads only the final 4 KiB. Entry extraction is bounded by declared and actual output size, with a 64 GiB aggregate expansion cap, a 1,000:1 entry compression-ratio guard, and per-format extraction limits.
+
+Large DEX files (over the remaining 256 MiB aggregate in-memory DEX budget) are staged to OPFS, then their string-offset table and strings are read using random-access Blob slices. This keeps the full DEX off the JavaScript heap, but large-file class/method decompilation is currently skipped; the report includes a warning. OPFS is browser-managed storage and may be unavailable or quota-limited.
+
+Text assets are decompressed through a WritableStream and scanned incrementally with a 64 KiB overlap; each entry is capped at 16 MiB of scan work and only a small preview is retained. The Explorer limits previews to 4 MiB and caps the rendered tree at 20,000 nodes. On browsers with the File System Access API, the Download action streams an entry directly to a user-selected file. The fallback download path is limited to 64 MiB. These safeguards make processing more memory-bounded, not a guarantee that every 16 GiB APK will fit browser CPU, storage, or runtime constraints. If the worker cannot be used, the page falls back to the main thread.
 
 ## Tabs
 
@@ -92,7 +99,7 @@ Toggle button in the header cycles dark ↔ light. The choice is stored in local
 
 ## Privacy
 
-The APK is read into an ArrayBuffer with the File API, transferred to the Web Worker, parsed in memory, and discarded when you close the tab. There is no network call. The page has a strict CSP that disallows it. You can run it offline.
+The selected APK stays on your device. Its `File` handle is passed to the Web Worker and read in bounded streams or slices; no APK bytes are uploaded. Large DEX files may be temporarily staged in browser-managed OPFS storage and removed after parsing. Analysis metadata and bounded previews are held in memory and discarded when you close the tab. There is no APK upload or telemetry. You can run it offline.
 
 ## Coverage
 
@@ -109,6 +116,7 @@ The APK is read into an ArrayBuffer with the File API, transferred to the Web Wo
 
 ## Limits
 
+- APK/ZIP uploads are accepted up to **16 GiB**. This is a file-size ceiling, not a guarantee that a browser can process an archive of that size: whole-file hashing/signature inspection and DEX parsing still require large in-memory buffers. Actual limits depend on the browser, operating system, and available RAM.
 - Each rule emits at most 20 instances per file, capped at 500 per rule globally
 - Up to 5000 DEX classes are scanned for rule patterns (the parser still reads them all)
 - Resource files larger than 300 KB are sampled rather than scanned end-to-end
