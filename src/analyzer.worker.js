@@ -1,7 +1,7 @@
 self.IPAA = self.IPAA || {};
 try {
     importScripts(
-        '../lib/jszip.min.js',
+        '../lib/zip.min.js',
         'core/entropy.js',
         'core/engine.js'
     );
@@ -16,13 +16,11 @@ self.onmessage = async (e) => {
     if (!msg || !msg.type) return;
     if (msg.type === 'analyze-file' || msg.type === 'analyze') {
         try {
-            const buffer = msg.type === 'analyze-file'
-                ? await msg.file.arrayBuffer()
-                : msg.buffer;
-            if (!(buffer instanceof ArrayBuffer)) {
-                throw new Error('Could not read the selected APK as an ArrayBuffer');
+            const input = msg.type === 'analyze-file' ? msg.file : msg.buffer;
+            if (!(input instanceof Blob) && !(input instanceof ArrayBuffer)) {
+                throw new Error('Could not read the selected APK file');
             }
-            const result = await self.APKA.analyzeAPK(buffer, msg.fileMeta, {
+            const result = await self.APKA.analyzeAPK(input, msg.fileMeta, {
                 onProgress: (percent, text) => self.postMessage({ type: 'progress', data: { percent, text } })
             });
             self.postMessage({ type: 'result', data: sanitize(result) });
