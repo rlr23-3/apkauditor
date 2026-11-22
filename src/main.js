@@ -7,6 +7,9 @@ const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
 
 const SEVS = ['issue', 'info', 'secure'];
 
+// Accepted upload ceiling. Actual processable size depends on browser/device memory.
+const MAX_APK_SIZE_BYTES = 16 * 1024 * 1024 * 1024;
+
 const State = {
     currentResults: null,
     currentFile: null,
@@ -93,20 +96,24 @@ async function analyzeFile(file) {
     showProgress(0, 'Initializing…');
     State.currentFile = file;
     State.viewerZip = null;
-    const arrayBuffer = await file.arrayBuffer();
+    if (file.size > MAX_APK_SIZE_BYTES) {
+        throw new Error('File exceeds the 16 GiB upload limit.');
+    }
     const fileMeta = { name: file.name, size: file.size, lastModified: file.lastModified };
 
     if (!State.worker) State.worker = setupWorker();
 
-    let workerBuffer = arrayBuffer;
-    if (State.worker && !State.workerFailed) {
-        workerBuffer = arrayBuffer.slice(0);
-    }
-
     return new Promise((resolve, reject) => {
+        // Read on the main thread only when the worker is unavailable or cannot accept the File.
+        // Sending the File avoids a second full-size ArrayBuffer copy for large APKs.
+        const runOnMainThreadFallback = () => {
+            file.arrayBuffer()
+                .then(arrayBuffer => runOnMainThread(arrayBuffer, fileMeta))
+                .then(resolve, reject);
+        };
         const useWorker = State.worker && !State.workerFailed;
         if (!useWorker) {
-            runOnMainThread(arrayBuffer, fileMeta).then(resolve, reject);
+            runOnMainThreadFallback();
             return;
         }
         const w = State.worker;
@@ -124,20 +131,19 @@ async function analyzeFile(file) {
                 console.warn('Worker fatal, falling back to main thread:', data.error);
                 w.removeEventListener('message', onMsg);
                 State.workerFailed = true;
-                runOnMainThread(arrayBuffer, fileMeta).then(resolve, reject);
+                runOnMainThreadFallback();
             }
         };
         w.addEventListener('message', onMsg);
         try {
-            w.postMessage({ type: 'analyze', buffer: workerBuffer, fileMeta }, [workerBuffer]);
+            w.postMessage({ type: 'analyze-file', file, fileMeta });
         } catch (e) {
             w.removeEventListener('message', onMsg);
             State.workerFailed = true;
-            runOnMainThread(arrayBuffer, fileMeta).then(resolve, reject);
+            runOnMainThreadFallback();
         }
     });
 }
-
 async function runOnMainThread(arrayBuffer, fileMeta) {
     if (!window.APKA || typeof window.APKA.analyzeAPK !== 'function') {
         throw new Error('Engine not loaded');
@@ -182,6 +188,9 @@ async function startAnalysis(file) {
     if (!file) return;
     if (!/\.apk$/i.test(file.name) && !/\.zip$/i.test(file.name)) {
         toast('Please select a .apk or .zip file', 'error'); return;
+    }
+    if (file.size > MAX_APK_SIZE_BYTES) {
+        toast('File exceeds the 16 GiB upload limit.', 'error'); return;
     }
     try {
         const results = await analyzeFile(file);
